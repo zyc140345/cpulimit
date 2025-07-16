@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <signal.h>
+#include <libgen.h>
 
 #include <assert.h>
 
@@ -84,6 +85,23 @@ int init_process_group(struct process_group *pgroup, int target_pid, int include
 	memset(&pgroup->proctable, 0, sizeof(pgroup->proctable));
 	pgroup->target_pid = target_pid;
 	pgroup->include_children = include_children;
+	pgroup->filter_by_user = 0;
+	pgroup->target_uid = 0;
+	pgroup->proclist = (struct list*)malloc(sizeof(struct list));
+	init_list(pgroup->proclist, 4);
+	memset(&pgroup->last_update, 0, sizeof(pgroup->last_update));
+	update_process_group(pgroup);
+	return 0;
+}
+
+int init_user_process_group(struct process_group *pgroup, uid_t uid)
+{
+	//hashtable initialization
+	memset(&pgroup->proctable, 0, sizeof(pgroup->proctable));
+	pgroup->target_pid = 0;
+	pgroup->include_children = 0;
+	pgroup->filter_by_user = 1;
+	pgroup->target_uid = uid;
 	pgroup->proclist = (struct list*)malloc(sizeof(struct list));
 	init_list(pgroup->proclist, 4);
 	memset(&pgroup->last_update, 0, sizeof(pgroup->last_update));
@@ -135,6 +153,9 @@ void update_process_group(struct process_group *pgroup)
 	long dt = timediff(&now, &pgroup->last_update) / 1000;
 	filter.pid = pgroup->target_pid;
 	filter.include_children = pgroup->include_children;
+	filter.uid = pgroup->target_uid;
+	filter.filter_by_user = pgroup->filter_by_user;
+	memset(filter.program_name, 0, sizeof(filter.program_name));
 	init_process_iterator(&it, &filter);
 	clear_list(pgroup->proclist);
 	init_list(pgroup->proclist, 4);

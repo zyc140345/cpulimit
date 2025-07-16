@@ -55,6 +55,8 @@ struct process {
 	pid_t pid;
 	//ppid of the process
 	pid_t ppid;
+	//user id of the process owner
+	uid_t uid;
 	//start time (unix timestamp)
 	int starttime;
 	//cputime used by the process (in milliseconds)
@@ -69,6 +71,8 @@ struct process_filter {
 	int pid;
 	int include_children;
 	char program_name[PATH_MAX+1];
+	uid_t uid;
+	int filter_by_user;
 };
 
 struct process_iterator {

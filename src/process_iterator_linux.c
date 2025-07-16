@@ -72,6 +72,7 @@ static int read_process_info(pid_t pid, struct process *p)
 {
 	static char buffer[1024];
 	static char statfile[32];
+	static char statusfile[32];
 	static char exefile[1024];
 	p->pid = pid;
 	//read stat file
@@ -95,6 +96,20 @@ static int read_process_info(pid_t pid, struct process *p)
 	for (i=0; i<7; i++)
 		token = strtok(NULL, " ");
 	p->starttime = atoi(token) / sysconf(_SC_CLK_TCK);
+	
+	//read status file to get UID
+	sprintf(statusfile, "/proc/%d/status", p->pid);
+	fd = fopen(statusfile, "r");
+	if (fd==NULL) return -1;
+	p->uid = -1; // default value
+	while (fgets(buffer, sizeof(buffer), fd) != NULL) {
+		if (strncmp(buffer, "Uid:", 4) == 0) {
+			sscanf(buffer, "Uid:\t%d", &p->uid);
+			break;
+		}
+	}
+	fclose(fd);
+	
 	//read command line
 	sprintf(exefile,"/proc/%d/cmdline", p->pid);
 	fd = fopen(exefile, "r");
@@ -148,6 +163,10 @@ int get_next_process(struct process_iterator *it, struct process *p)
 		closedir(it->dip);
 		it->dip = NULL;
 		if (ret != 0) return -1;
+		// Check user filter if enabled
+		if (it->filter->filter_by_user == 1 && p->uid != it->filter->uid) {
+			return -1;
+		}
 		return 0;
 	}
 	struct dirent *dit = NULL;
@@ -157,7 +176,11 @@ int get_next_process(struct process_iterator *it, struct process *p)
 			continue;
 		p->pid = atoi(dit->d_name);
 		if (it->filter->pid != 0 && it->filter->pid != p->pid && !is_child_of(p->pid, it->filter->pid)) continue;
-		read_process_info(p->pid, p);
+		if (read_process_info(p->pid, p) != 0) continue;
+		// Check user filter if enabled
+		if (it->filter->filter_by_user == 1 && p->uid != it->filter->uid) {
+			continue;
+		}
 		//p->starttime += it->boot_time;
 		break;
 	}

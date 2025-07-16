@@ -38,17 +38,18 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/sysctl.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#ifdef __APPLE__ || __FREEBSD__
+#if defined(__APPLE__) || defined(__FREEBSD__)
 #include <libgen.h>
+#include <sys/sysctl.h>
 #endif
 
 #include "process_group.h"
 #include "list.h"
+#include <pwd.h>
 
 #ifdef HAVE_SYS_SYSINFO_H
 #include <sys/sysinfo.h>
@@ -129,6 +130,7 @@ static void print_usage(FILE *stream, int exit_code)
 	fprintf(stream, "   TARGET must be exactly one of these:\n");
 	fprintf(stream, "      -p, --pid=N            pid of the process (implies -z)\n");
 	fprintf(stream, "      -e, --exe=FILE         name of the executable program file or path name\n");
+	fprintf(stream, "      -u, --user=USER        limit all processes owned by this user\n");
 	fprintf(stream, "      COMMAND [ARGS]         run this command and limit it (implies -z)\n");
 	fprintf(stream, "\nReport bugs to <marlonx80@hotmail.com>.\n");
 	exit(exit_code);
@@ -314,14 +316,129 @@ void limit_process(pid_t pid, double limit, int include_children)
 	close_process_group(&pgroup);
 }
 
+void limit_user_processes(uid_t uid, double limit)
+{
+	//slice of the slot in which the process is allowed to run
+	struct timespec twork;
+	//slice of the slot in which the process is stopped
+	struct timespec tsleep;
+	//when the last twork has started
+	struct timeval startwork;
+	//when the last twork has finished
+	struct timeval endwork;
+	//initialization
+	memset(&twork, 0, sizeof(struct timespec));
+	memset(&tsleep, 0, sizeof(struct timespec));
+	memset(&startwork, 0, sizeof(struct timeval));
+	memset(&endwork, 0, sizeof(struct timeval));	
+	//last working time in microseconds
+	unsigned long workingtime = 0;
+	(void)workingtime; // suppress unused variable warning
+	//generic list item
+	struct list_node *node;
+	//counter
+	int c = 0;
+
+	//get a better priority
+	increase_priority();
+	
+	//initialize user process group
+	init_user_process_group(&pgroup, uid);
+
+	if (verbose) printf("Members in the process group owned by user %d: %d\n", uid, pgroup.proclist->count);
+
+	//rate at which we are keeping active the processes (range 0-1)
+	//1 means that the process are using all the twork slice
+	double workingrate = -1;
+	
+	while(1) {
+		update_process_group(&pgroup);
+
+		if (pgroup.proclist->count==0) {
+			if (verbose) printf("No more processes for user %d.\n", uid);
+			if (lazy) break;
+			sleep(2);
+			continue;
+		}
+		
+		//total cpu actual usage (range 0-1)
+		//1 means that the processes are using 100% cpu
+		double pcpu = -1;
+
+		//estimate how much the controlled processes are using the cpu in the working interval
+		for (node = pgroup.proclist->first; node != NULL; node = node->next) {
+			struct process *proc = (struct process*)(node->data);
+			if (proc->cpu_usage < 0) {
+				continue;
+			}
+			if (pcpu < 0) pcpu = 0;
+			pcpu += proc->cpu_usage;
+		}
+
+		//adjust work and sleep time slices
+		if (pcpu < 0) {
+			//it's the 1st cycle, initialize workingrate
+			pcpu = limit;
+			workingrate = limit;
+			twork.tv_nsec = TIME_SLOT * limit * 1000;
+		}
+		else {
+			//adjust workingrate
+			workingrate = workingrate * limit / pcpu;
+			if (workingrate > 1.0) workingrate = 1.0;
+			twork.tv_nsec = TIME_SLOT * workingrate * 1000;
+		}
+		tsleep.tv_nsec = TIME_SLOT * 1000 - twork.tv_nsec;
+
+		if (verbose) {
+			printf("User %d processes: %d, CPU usage: %.2f%%, limit: %.2f%%, working rate: %.2f%%\n",
+				uid, pgroup.proclist->count, pcpu*100, limit*100, workingrate*100);
+		}
+
+		//resume processes
+		gettimeofday(&startwork, NULL);
+		for (node = pgroup.proclist->first; node != NULL; node = node->next) {
+			struct process *proc = (struct process*)(node->data);
+			if (kill(proc->pid, SIGCONT) != 0) {
+				//process may have died
+				continue;
+			}
+		}
+
+		//work slice
+		nanosleep(&twork, NULL);
+
+		//stop processes
+		gettimeofday(&endwork, NULL);
+		for (node = pgroup.proclist->first; node != NULL; node = node->next) {
+			struct process *proc = (struct process*)(node->data);
+			if (kill(proc->pid, SIGSTOP) != 0) {
+				//process may have died
+				continue;
+			}
+		}
+
+		//sleep slice
+		nanosleep(&tsleep, NULL);
+
+		//update working time
+		workingtime = timediff(&endwork, &startwork);
+		c++;
+	}
+	close_process_group(&pgroup);
+}
+
 int main(int argc, char **argv) {
 	//argument variables
 	const char *exe = NULL;
+	const char *user = NULL;
 	int perclimit = 0;
 	int exe_ok = 0;
 	int pid_ok = 0;
 	int limit_ok = 0;
+	int user_ok = 0;
 	pid_t pid = 0;
+	uid_t uid = 0;
 	int include_children = 0;
 
 	//get program name
@@ -336,12 +453,13 @@ int main(int argc, char **argv) {
 	int next_option;
     int option_index = 0;
 	//A string listing valid short options letters
-	const char* short_options = "+p:e:l:vzih";
+	const char* short_options = "+p:e:l:u:vzih";
 	//An array describing valid long options
 	const struct option long_options[] = {
 		{ "pid",        required_argument, NULL, 'p' },
 		{ "exe",        required_argument, NULL, 'e' },
 		{ "limit",      required_argument, NULL, 'l' },
+		{ "user",       required_argument, NULL, 'u' },
 		{ "verbose",    no_argument,       NULL, 'v' },
 		{ "lazy",       no_argument,       NULL, 'z' },
 		{ "include-children", no_argument,  NULL, 'i' },
@@ -363,6 +481,10 @@ int main(int argc, char **argv) {
 			case 'l':
 				perclimit = atoi(optarg);
 				limit_ok = 1;
+				break;
+			case 'u':
+				user = optarg;
+				user_ok = 1;
 				break;
 			case 'v':
 				verbose = 1;
@@ -395,6 +517,31 @@ int main(int argc, char **argv) {
 		lazy = 1;
 	}
 
+	// Handle user option - convert username to UID
+	if (user_ok) {
+		struct passwd *pwd;
+		char *endptr;
+		
+		// Try to parse as numeric UID first
+		uid = strtoul(user, &endptr, 10);
+		if (*endptr != '\0') {
+			// Not a number, treat as username
+			pwd = getpwnam(user);
+			if (pwd == NULL) {
+				fprintf(stderr, "Error: User '%s' not found\n", user);
+				exit(1);
+			}
+			uid = pwd->pw_uid;
+		} else {
+			// Verify numeric UID exists
+			pwd = getpwuid(uid);
+			if (pwd == NULL) {
+				fprintf(stderr, "Error: User ID %d not found\n", uid);
+				exit(1);
+			}
+		}
+	}
+
 	if (!limit_ok) {
 		fprintf(stderr,"Error: You must specify a cpu limit percentage\n");
 		print_usage(stderr, 1);
@@ -408,14 +555,14 @@ int main(int argc, char **argv) {
 	}
 
 	int command_mode = optind < argc;
-	if (exe_ok + pid_ok + command_mode == 0) {
-		fprintf(stderr,"Error: You must specify one target process, either by name, pid, or command line\n");
+	if (exe_ok + pid_ok + user_ok + command_mode == 0) {
+		fprintf(stderr,"Error: You must specify one target process, either by name, pid, user, or command line\n");
 		print_usage(stderr, 1);
 		exit(1);
 	}
 	
-	if (exe_ok + pid_ok + command_mode > 1) {
-		fprintf(stderr,"Error: You must specify exactly one target process, either by name, pid, or command line\n");
+	if (exe_ok + pid_ok + user_ok + command_mode > 1) {
+		fprintf(stderr,"Error: You must specify exactly one target process, either by name, pid, user, or command line\n");
 		print_usage(stderr, 1);
 		exit(1);
 	}
@@ -487,43 +634,50 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	while(1) {
-		//look for the target process..or wait for it
-		pid_t ret = 0;
-		if (pid_ok) {
-			//search by pid
-			ret = find_process_by_pid(pid);
-			if (ret == 0) {
-				printf("No process found\n");
-			}
-			else if (ret < 0) {
-				printf("Process found but you aren't allowed to control it\n");
-			}
-		}
-		else {
-			//search by file or path name
-			ret = find_process_by_name(exe);
-			if (ret == 0) {
-				printf("No process found\n");
-			}
-			else if (ret < 0) {
-				printf("Process found but you aren't allowed to control it\n");
+	if (user_ok) {
+		//user mode - limit all processes for a specific user
+		if (verbose) printf("Limiting all processes owned by user %s (UID: %d)\n", user, uid);
+		limit_user_processes(uid, limit);
+	}
+	else {
+		while(1) {
+			//look for the target process..or wait for it
+			pid_t ret = 0;
+			if (pid_ok) {
+				//search by pid
+				ret = find_process_by_pid(pid);
+				if (ret == 0) {
+					printf("No process found\n");
+				}
+				else if (ret < 0) {
+					printf("Process found but you aren't allowed to control it\n");
+				}
 			}
 			else {
-				pid = ret;
+				//search by file or path name
+				ret = find_process_by_name(exe);
+				if (ret == 0) {
+					printf("No process found\n");
+				}
+				else if (ret < 0) {
+					printf("Process found but you aren't allowed to control it\n");
+				}
+				else {
+					pid = ret;
+				}
 			}
-		}
-		if (ret > 0) {
-			if (ret == cpulimit_pid) {
-				printf("Target process %d is cpulimit itself! Aborting because it makes no sense\n", ret);
-				exit(1);
+			if (ret > 0) {
+				if (ret == cpulimit_pid) {
+					printf("Target process %d is cpulimit itself! Aborting because it makes no sense\n", ret);
+					exit(1);
+				}
+				printf("Process %d found\n", pid);
+				//control
+				limit_process(pid, limit, include_children);
 			}
-			printf("Process %d found\n", pid);
-			//control
-			limit_process(pid, limit, include_children);
+			if (lazy) break;
+			sleep(2);
 		}
-		if (lazy) break;
-		sleep(2);
 	};
 	
 	exit(0);

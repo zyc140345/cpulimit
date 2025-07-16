@@ -38,9 +38,13 @@ struct process_group
 	pid_t target_pid;
 	int include_children;
 	struct timeval last_update;
+	uid_t target_uid;
+	int filter_by_user;
 };
 
 int init_process_group(struct process_group *pgroup, int target_pid, int include_children);
+
+int init_user_process_group(struct process_group *pgroup, uid_t uid);
 
 void update_process_group(struct process_group *pgroup);
 
