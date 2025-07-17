@@ -20,6 +20,72 @@
  */
 
 #include <sys/vfs.h>
+#include <string.h>
+
+static int should_exclude_process(struct process *p, int exclude_interactive)
+{
+	if (!exclude_interactive) return 0;
+	
+	// Safety check: ensure command is not null and not empty
+	if (p == NULL || p->command == NULL || p->command[0] == '\0') {
+		return 0; // don't exclude if we can't determine the command
+	}
+	
+	// Extract just the executable name from command path
+	char *cmd_name = NULL;
+	char *last_slash = strrchr(p->command, '/');
+	if (last_slash && last_slash[1] != '\0') {
+		// Ensure we don't point past the end of string
+		cmd_name = last_slash + 1;
+	} else {
+		cmd_name = p->command;
+	}
+	
+	// Safety check: ensure cmd_name is valid
+	if (cmd_name == NULL || cmd_name[0] == '\0') {
+		return 0; // don't exclude if command name is invalid
+	}
+	
+	// List of critical processes to exclude from CPU limiting
+	const char *excluded_procs[] = {
+		"bash", "sh", "zsh", "fish", "tcsh", "csh",  // shells
+		"ssh", "sshd",                               // SSH
+		"tmux", "screen",                           // terminal multiplexers  
+		"vim", "vi", "nano", "emacs",               // editors
+		"code", "code-server",                      // VSCode
+		"node",                                     // Node.js (often used by VSCode)
+		"systemd", "init",                          // system processes
+		"cpulimit",                                 // ourselves
+		NULL
+	};
+	
+	// Check if this process should be excluded
+	for (int i = 0; excluded_procs[i] != NULL; i++) {
+		size_t excluded_len = strlen(excluded_procs[i]);
+		size_t cmd_len = strlen(cmd_name);
+		
+		// Use safer comparison: check if cmd_name starts with excluded_proc name
+		// and is either exact match or followed by a space/null terminator
+		if (cmd_len >= excluded_len && 
+		    strncmp(cmd_name, excluded_procs[i], excluded_len) == 0 &&
+		    (cmd_name[excluded_len] == '\0' || cmd_name[excluded_len] == ' ')) {
+			return 1; // exclude this process
+		}
+		
+		// Also check for login shells (commands starting with '-')
+		if (cmd_name[0] == '-' && cmd_len > 1) {
+			char *login_shell = cmd_name + 1; // Skip the '-'
+			size_t login_len = cmd_len - 1;
+			if (login_len >= excluded_len && 
+			    strncmp(login_shell, excluded_procs[i], excluded_len) == 0 &&
+			    (login_shell[excluded_len] == '\0' || login_shell[excluded_len] == ' ')) {
+				return 1; // exclude this login shell
+			}
+		}
+	}
+	
+	return 0; // don't exclude
+}
 
 static int get_boot_time()
 {
@@ -76,7 +142,7 @@ static int read_process_info(pid_t pid, struct process *p)
 	static char exefile[1024];
 	p->pid = pid;
 	//read stat file
-	sprintf(statfile, "/proc/%d/stat", p->pid);
+	snprintf(statfile, sizeof(statfile), "/proc/%d/stat", p->pid);
 	FILE *fd = fopen(statfile, "r");
 	if (fd==NULL) return -1;
 	if (fgets(buffer, sizeof(buffer), fd)==NULL) {
@@ -98,27 +164,32 @@ static int read_process_info(pid_t pid, struct process *p)
 	p->starttime = atoi(token) / sysconf(_SC_CLK_TCK);
 	
 	//read status file to get UID
-	sprintf(statusfile, "/proc/%d/status", p->pid);
+	snprintf(statusfile, sizeof(statusfile), "/proc/%d/status", p->pid);
 	fd = fopen(statusfile, "r");
-	if (fd==NULL) return -1;
+	if (fd == NULL) return -1;
 	p->uid = -1; // default value
 	while (fgets(buffer, sizeof(buffer), fd) != NULL) {
 		if (strncmp(buffer, "Uid:", 4) == 0) {
-			sscanf(buffer, "Uid:\t%d", &p->uid);
+			sscanf(buffer, "Uid:\t%u", &p->uid);
 			break;
 		}
 	}
 	fclose(fd);
 	
 	//read command line
-	sprintf(exefile,"/proc/%d/cmdline", p->pid);
+	snprintf(exefile, sizeof(exefile), "/proc/%d/cmdline", p->pid);
 	fd = fopen(exefile, "r");
-	if (fgets(buffer, sizeof(buffer), fd)==NULL) {
+	if (fd != NULL) {
+		if (fgets(buffer, sizeof(buffer), fd) != NULL) {
+			strncpy(p->command, buffer, PATH_MAX);
+			p->command[PATH_MAX] = '\0';
+		} else {
+			p->command[0] = '\0';
+		}
 		fclose(fd);
-		return -1;
+	} else {
+		p->command[0] = '\0';
 	}
-	fclose(fd);
-	strcpy(p->command, buffer);
 	return 0;
 }
 
@@ -126,7 +197,7 @@ static pid_t getppid_of(pid_t pid)
 {
 	char statfile[20];
 	char buffer[1024];
-	sprintf(statfile, "/proc/%d/stat", pid);
+	snprintf(statfile, sizeof(statfile), "/proc/%d/stat", pid);
 	FILE *fd = fopen(statfile, "r");
 	if (fd==NULL) return -1;
 	if (fgets(buffer, sizeof(buffer), fd)==NULL) {
@@ -163,8 +234,13 @@ int get_next_process(struct process_iterator *it, struct process *p)
 		closedir(it->dip);
 		it->dip = NULL;
 		if (ret != 0) return -1;
+		
 		// Check user filter if enabled
 		if (it->filter->filter_by_user == 1 && p->uid != it->filter->uid) {
+			return -1;
+		}
+		// Check if this process should be excluded from limiting
+		if (should_exclude_process(p, it->filter->exclude_interactive)) {
 			return -1;
 		}
 		return 0;
@@ -177,8 +253,13 @@ int get_next_process(struct process_iterator *it, struct process *p)
 		p->pid = atoi(dit->d_name);
 		if (it->filter->pid != 0 && it->filter->pid != p->pid && !is_child_of(p->pid, it->filter->pid)) continue;
 		if (read_process_info(p->pid, p) != 0) continue;
+		
 		// Check user filter if enabled
 		if (it->filter->filter_by_user == 1 && p->uid != it->filter->uid) {
+			continue;
+		}
+		// Check if this process should be excluded from limiting
+		if (should_exclude_process(p, it->filter->exclude_interactive)) {
 			continue;
 		}
 		//p->starttime += it->boot_time;

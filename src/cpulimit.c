@@ -51,6 +51,10 @@
 #include "list.h"
 #include <pwd.h>
 
+//global variable for signal-safe exit
+volatile sig_atomic_t exit_requested = 0;
+
+
 #ifdef HAVE_SYS_SYSINFO_H
 #include <sys/sysinfo.h>
 #endif
@@ -96,6 +100,9 @@ int lazy = 0;
 //SIGINT and SIGTERM signal handler
 static void quit(int sig)
 {
+	//set exit flag for signal-safe exit
+	exit_requested = 1;
+	
 	//let all the processes continue if stopped
 	struct list_node *node = NULL;
 	if (pgroup.proclist != NULL)
@@ -352,6 +359,9 @@ void limit_user_processes(uid_t uid, double limit)
 	double workingrate = -1;
 	
 	while(1) {
+		if (exit_requested) {
+			break;
+		}
 		update_process_group(&pgroup);
 
 		if (pgroup.proclist->count==0) {
@@ -397,12 +407,16 @@ void limit_user_processes(uid_t uid, double limit)
 
 		//resume processes
 		gettimeofday(&startwork, NULL);
-		for (node = pgroup.proclist->first; node != NULL; node = node->next) {
+		node = pgroup.proclist->first;
+		while (node != NULL) {
+			struct list_node *next_node = node->next;
 			struct process *proc = (struct process*)(node->data);
 			if (kill(proc->pid, SIGCONT) != 0) {
-				//process may have died
-				continue;
+				//process may have died, remove it from the list
+				delete_node(pgroup.proclist, node);
+				remove_process(&pgroup, proc->pid);
 			}
+			node = next_node;
 		}
 
 		//work slice
@@ -410,12 +424,16 @@ void limit_user_processes(uid_t uid, double limit)
 
 		//stop processes
 		gettimeofday(&endwork, NULL);
-		for (node = pgroup.proclist->first; node != NULL; node = node->next) {
+		node = pgroup.proclist->first;
+		while (node != NULL) {
+			struct list_node *next_node = node->next;
 			struct process *proc = (struct process*)(node->data);
 			if (kill(proc->pid, SIGSTOP) != 0) {
-				//process may have died
-				continue;
+				//process may have died, remove it from the list
+				delete_node(pgroup.proclist, node);
+				remove_process(&pgroup, proc->pid);
 			}
+			node = next_node;
 		}
 
 		//sleep slice
@@ -570,6 +588,7 @@ int main(int argc, char **argv) {
 	//all arguments are ok!
 	signal(SIGINT, quit);
 	signal(SIGTERM, quit);
+	signal(SIGHUP, quit);
 
 	//print the number of available cpu
 	if (verbose) printf("%d cpu detected\n", NCPU);

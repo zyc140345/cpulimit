@@ -73,6 +73,7 @@ struct process_filter {
 	char program_name[PATH_MAX+1];
 	uid_t uid;
 	int filter_by_user;
+	int exclude_interactive;
 };
 
 struct process_iterator {

@@ -51,6 +51,8 @@ void test_single_process()
 	//don't iterate children
 	filter.pid = getpid();
 	filter.include_children = 0;
+	filter.filter_by_user = 0;
+	filter.exclude_interactive = 0;
 	count = 0;
 //	time_t now = time(NULL);
 	init_process_iterator(&it, &filter);
@@ -67,6 +69,8 @@ void test_single_process()
 	//iterate children
 	filter.pid = getpid();
 	filter.include_children = 0;
+	filter.filter_by_user = 0;
+	filter.exclude_interactive = 0;
 	count = 0;
 //	now = time(NULL);
 	init_process_iterator(&it, &filter);
@@ -96,6 +100,8 @@ void test_multiple_process()
 	}
 	filter.pid = getpid();
 	filter.include_children = 1;
+	filter.filter_by_user = 0;
+	filter.exclude_interactive = 0;
 	init_process_iterator(&it, &filter);
 	int count = 0;
 //	time_t now = time(NULL);
@@ -120,6 +126,8 @@ void test_all_processes()
 	struct process_filter filter;
 	filter.pid = 0;
 	filter.include_children = 0;
+	filter.filter_by_user = 0;
+	filter.exclude_interactive = 0;
 	init_process_iterator(&it, &filter);
 	int count = 0;
 //	time_t now = time(NULL);
@@ -198,6 +206,8 @@ void test_process_name(const char * command)
 	struct process_filter filter;
 	filter.pid = getpid();
 	filter.include_children = 0;
+	filter.filter_by_user = 0;
+	filter.exclude_interactive = 0;
 	init_process_iterator(&it, &filter);
 	assert(get_next_process(&it, &process) == 0);
 	assert(process.pid == getpid());

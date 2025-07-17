@@ -40,6 +40,7 @@ struct process_group
 	struct timeval last_update;
 	uid_t target_uid;
 	int filter_by_user;
+	int exclude_interactive;
 };
 
 int init_process_group(struct process_group *pgroup, int target_pid, int include_children);

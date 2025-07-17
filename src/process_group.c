@@ -58,6 +58,8 @@ int find_process_by_name(const char *process_name)
 	struct process_filter filter;
 	filter.pid = 0;
 	filter.include_children = 0;
+	filter.filter_by_user = 0;
+	filter.exclude_interactive = 0;
 	init_process_iterator(&it, &filter);
 	while (get_next_process(&it, &proc) != -1)
 	{
@@ -87,6 +89,7 @@ int init_process_group(struct process_group *pgroup, int target_pid, int include
 	pgroup->include_children = include_children;
 	pgroup->filter_by_user = 0;
 	pgroup->target_uid = 0;
+	pgroup->exclude_interactive = 0;
 	pgroup->proclist = (struct list*)malloc(sizeof(struct list));
 	init_list(pgroup->proclist, 4);
 	memset(&pgroup->last_update, 0, sizeof(pgroup->last_update));
@@ -102,6 +105,7 @@ int init_user_process_group(struct process_group *pgroup, uid_t uid)
 	pgroup->include_children = 0;
 	pgroup->filter_by_user = 1;
 	pgroup->target_uid = uid;
+	pgroup->exclude_interactive = 1;
 	pgroup->proclist = (struct list*)malloc(sizeof(struct list));
 	init_list(pgroup->proclist, 4);
 	memset(&pgroup->last_update, 0, sizeof(pgroup->last_update));
@@ -155,6 +159,7 @@ void update_process_group(struct process_group *pgroup)
 	filter.include_children = pgroup->include_children;
 	filter.uid = pgroup->target_uid;
 	filter.filter_by_user = pgroup->filter_by_user;
+	filter.exclude_interactive = pgroup->exclude_interactive;
 	memset(filter.program_name, 0, sizeof(filter.program_name));
 	init_process_iterator(&it, &filter);
 	clear_list(pgroup->proclist);
