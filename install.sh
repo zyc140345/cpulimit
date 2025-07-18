@@ -22,6 +22,7 @@ show_usage() {
     echo "  $0 restart <username>                         # Restart cpulimit for user"
     echo "  $0 remove <username>                          # Remove cpulimit for user"
     echo "  $0 logs <username>                            # View logs for user"
+    echo "  $0 config {edit|show|sync}                    # Manage exclusion configuration"
     echo ""
     echo "Examples:"
     echo "  $0 install webapp 50                          # Limit webapp user to 50% CPU"
@@ -60,9 +61,10 @@ install_cpulimit() {
 
     log "Starting cpulimit installation for user: $USERNAME with CPU limit: $CPU_LIMIT%"
 
-    # Create cpulimit directory
-    log "Creating cpulimit directory..."
+    # Create cpulimit directories
+    log "Creating cpulimit directories..."
     mkdir -p "$CPULIMIT_DIR"
+    sudo mkdir -p /etc/cpulimit
 
     # Install cpulimit binary if not already present
     if [ ! -f "$CPULIMIT_BIN" ]; then
@@ -81,6 +83,20 @@ install_cpulimit() {
         fi
     else
         log "cpulimit binary already installed at $CPULIMIT_BIN"
+    fi
+
+    # Install system-level exclusion config file
+    if [ ! -f "/etc/cpulimit/exclude.conf" ]; then
+        if [ -f "exclude.conf" ]; then
+            log "Installing exclusion configuration..."
+            sudo cp exclude.conf /etc/cpulimit/exclude.conf
+        else
+            log "Error: exclude.conf not found in current directory"
+            log "Please ensure exclude.conf is present in the project directory"
+            exit 1
+        fi
+    else
+        log "Exclusion configuration already exists at /etc/cpulimit/exclude.conf"
     fi
 
     # Create supervisor configuration
@@ -219,6 +235,45 @@ case "$1" in
         ;;
     logs)
         show_logs "$2"
+        ;;
+    config)
+        case "$2" in
+            edit)
+                echo "Opening cpulimit exclusion config for editing..."
+                sudo ${EDITOR:-nano} /etc/cpulimit/exclude.conf
+                ;;
+            show)
+                echo "Current cpulimit exclusion configuration:"
+                echo "========================================"
+                cat /etc/cpulimit/exclude.conf
+                ;;
+            sync)
+                echo "Syncing configuration from project to system..."
+                if [ -f "exclude.conf" ]; then
+                    if [ ! -f "/etc/cpulimit/exclude.conf" ]; then
+                        log "Installing exclusion configuration..."
+                        sudo cp exclude.conf /etc/cpulimit/exclude.conf
+                        echo "Configuration installed successfully."
+                    else
+                        log "Updating exclusion configuration..."
+                        sudo cp exclude.conf /etc/cpulimit/exclude.conf
+                        echo "Configuration updated successfully."
+                        echo "Note: You need to restart cpulimit services for changes to take effect."
+                        ./install.sh list
+                    fi
+                else
+                    echo "Error: exclude.conf not found in current directory"
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "Usage: $0 config {edit|show|sync}"
+                echo "  edit - Edit the exclusion configuration file"
+                echo "  show - Display current configuration"
+                echo "  sync - Sync project config to system config"
+                exit 1
+                ;;
+        esac
         ;;
     *)
         show_usage

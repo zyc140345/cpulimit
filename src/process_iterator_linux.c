@@ -21,6 +21,8 @@
 
 #include <sys/vfs.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 static int should_exclude_process(struct process *p, int exclude_interactive)
 {
@@ -46,18 +48,55 @@ static int should_exclude_process(struct process *p, int exclude_interactive)
 		return 0; // don't exclude if command name is invalid
 	}
 	
-	// List of critical processes to exclude from CPU limiting
-	const char *excluded_procs[] = {
-		"bash", "sh", "zsh", "fish", "tcsh", "csh",  // shells
-		"ssh", "sshd",                               // SSH
-		"tmux", "screen",                           // terminal multiplexers  
-		"vim", "vi", "nano", "emacs",               // editors
-		"code", "code-server",                      // VSCode
-		"node",                                     // Node.js (often used by VSCode)
-		"systemd", "init",                          // system processes
-		"cpulimit",                                 // ourselves
-		NULL
+	// Minimal fallback list for when no config file is available
+	static const char *default_excluded_procs[] = {
+		"bash", "sh", "ssh", "sshd", "systemd", "init", "cpulimit", NULL
 	};
+
+	// Static array to hold exclusion list (loaded from config or defaults)
+	static char *excluded_procs[256];
+	static int exclusion_list_loaded = 0;
+
+	// Load exclusion list from config file or use defaults
+	if (!exclusion_list_loaded) {
+		FILE *config_file = fopen("/etc/cpulimit/exclude.conf", "r");
+		
+		if (config_file) {
+			// Load from config file
+			char line[256];
+			int count = 0;
+			while (fgets(line, sizeof(line), config_file) && count < 255) {
+				// Remove newline and comments
+				char *comment = strchr(line, '#');
+				if (comment) *comment = '\0';
+				
+				// Trim whitespace
+				char *start = line;
+				while (*start && (*start == ' ' || *start == '\t')) start++;
+				char *end = start + strlen(start) - 1;
+				while (end > start && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end--;
+				*(end + 1) = '\0';
+				
+				// Skip empty lines
+				if (*start) {
+					excluded_procs[count] = malloc(strlen(start) + 1);
+					strcpy(excluded_procs[count], start);
+					count++;
+				}
+			}
+			excluded_procs[count] = NULL;
+			fclose(config_file);
+		} else {
+			// Use default list
+			int i;
+			for (i = 0; default_excluded_procs[i] != NULL; i++) {
+				excluded_procs[i] = malloc(strlen(default_excluded_procs[i]) + 1);
+				strcpy(excluded_procs[i], default_excluded_procs[i]);
+			}
+			excluded_procs[i] = NULL;
+		}
+		exclusion_list_loaded = 1;
+	}
 	
 	// Check if this process should be excluded
 	for (int i = 0; excluded_procs[i] != NULL; i++) {
@@ -80,6 +119,15 @@ static int should_exclude_process(struct process *p, int exclude_interactive)
 			    strncmp(login_shell, excluded_procs[i], excluded_len) == 0 &&
 			    (login_shell[excluded_len] == '\0' || login_shell[excluded_len] == ' ')) {
 				return 1; // exclude this login shell
+			}
+		}
+		
+		// Special handling for Python scripts - check full command line
+		if (strcmp(cmd_name, "python") == 0 || strcmp(cmd_name, "python3") == 0) {
+			// Check if this is a monitoring tool by looking at the full command
+			if (strstr(p->command, "nvitop") || strstr(p->command, "glances") ||
+			    strstr(p->command, "bpytop") || strstr(p->command, "py-spy")) {
+				return 1; // exclude Python monitoring tools
 			}
 		}
 	}
@@ -178,9 +226,21 @@ static int read_process_info(pid_t pid, struct process *p)
 	
 	//read command line
 	snprintf(exefile, sizeof(exefile), "/proc/%d/cmdline", p->pid);
-	fd = fopen(exefile, "r");
+	fd = fopen(exefile, "rb");  // Use binary mode to read null-separated args
 	if (fd != NULL) {
-		if (fgets(buffer, sizeof(buffer), fd) != NULL) {
+		size_t bytes_read = fread(buffer, 1, sizeof(buffer) - 1, fd);
+		if (bytes_read > 0) {
+			buffer[bytes_read] = '\0';
+			// Convert null separators to spaces for easier parsing
+			for (size_t i = 0; i < bytes_read; i++) {
+				if (buffer[i] == '\0') {
+					buffer[i] = ' ';
+				}
+			}
+			// Remove trailing space if exists
+			if (bytes_read > 0 && buffer[bytes_read - 1] == ' ') {
+				buffer[bytes_read - 1] = '\0';
+			}
 			strncpy(p->command, buffer, PATH_MAX);
 			p->command[PATH_MAX] = '\0';
 		} else {
