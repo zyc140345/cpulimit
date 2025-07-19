@@ -24,6 +24,92 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+// Hash table for fast process name lookup
+#define EXCLUDE_HASH_SIZE 256
+struct exclude_entry {
+	char *name;
+	struct exclude_entry *next;
+};
+static struct exclude_entry *exclude_hash[EXCLUDE_HASH_SIZE];
+static int exclusion_list_loaded = 0;
+
+// Simple hash function for process names (djb2 algorithm)
+static unsigned int hash_process_name(const char *name) {
+	unsigned int hash = 5381;
+	while (*name) {
+		hash = ((hash << 5) + hash) + *name++;
+	}
+	return hash % EXCLUDE_HASH_SIZE;
+}
+
+// Add process name to hash table
+static void add_excluded_process(const char *name) {
+	unsigned int hash = hash_process_name(name);
+	struct exclude_entry *entry = malloc(sizeof(struct exclude_entry));
+	if (entry) {
+		entry->name = malloc(strlen(name) + 1);
+		if (entry->name) {
+			strcpy(entry->name, name);
+			entry->next = exclude_hash[hash];
+			exclude_hash[hash] = entry;
+		} else {
+			free(entry);
+		}
+	}
+}
+
+// Check if process name is in hash table
+static int is_process_excluded(const char *name) {
+	if (!name) return 0; // Safety check for null pointer
+	unsigned int hash = hash_process_name(name);
+	struct exclude_entry *entry = exclude_hash[hash];
+	while (entry) {
+		if (strcmp(entry->name, name) == 0) {
+			return 1;
+		}
+		entry = entry->next;
+	}
+	return 0;
+}
+
+// Clean up hash table memory (called on program exit)
+static void cleanup_exclusion_list(void) {
+	for (int i = 0; i < EXCLUDE_HASH_SIZE; i++) {
+		struct exclude_entry *entry = exclude_hash[i];
+		while (entry) {
+			struct exclude_entry *next = entry->next;
+			free(entry->name);
+			free(entry);
+			entry = next;
+		}
+		exclude_hash[i] = NULL;
+	}
+}
+
+// Extract actual program name from Python command line
+static const char* extract_python_program_name(const char *cmdline) {
+	if (!cmdline) return NULL;
+	
+	// Find the last argument (tool name) - look for the last space
+	const char *last_arg = strrchr(cmdline, ' ');
+	if (!last_arg) return NULL;
+	
+	last_arg++; // Skip space
+	if (*last_arg == '\0') return NULL; // Empty argument
+	
+	// Extract just the tool name (after last slash if path is present)
+	const char *tool_name = strrchr(last_arg, '/');
+	if (tool_name) {
+		tool_name++; // Skip slash
+		if (*tool_name == '\0') return NULL; // Empty tool name after slash
+	} else {
+		tool_name = last_arg;
+	}
+	
+	// Final safety check
+	return (*tool_name != '\0') ? tool_name : NULL;
+}
+
 static int should_exclude_process(struct process *p, int exclude_interactive)
 {
 	if (!exclude_interactive) return 0;
@@ -35,12 +121,25 @@ static int should_exclude_process(struct process *p, int exclude_interactive)
 	
 	// Extract just the executable name from command path
 	char *cmd_name = NULL;
-	char *last_slash = strrchr(p->command, '/');
+	char *first_space = strchr(p->command, ' ');
+	char *cmd_part = p->command;
+	
+	// If there's a space, only consider the part before the first space
+	if (first_space) {
+		char cmd_buffer[256];
+		size_t cmd_len = first_space - p->command;
+		if (cmd_len >= sizeof(cmd_buffer)) cmd_len = sizeof(cmd_buffer) - 1;
+		strncpy(cmd_buffer, p->command, cmd_len);
+		cmd_buffer[cmd_len] = '\0';
+		cmd_part = cmd_buffer;
+	}
+	
+	// Now extract just the executable name from the path
+	char *last_slash = strrchr(cmd_part, '/');
 	if (last_slash && last_slash[1] != '\0') {
-		// Ensure we don't point past the end of string
 		cmd_name = last_slash + 1;
 	} else {
-		cmd_name = p->command;
+		cmd_name = cmd_part;
 	}
 	
 	// Safety check: ensure cmd_name is valid
@@ -53,19 +152,17 @@ static int should_exclude_process(struct process *p, int exclude_interactive)
 		"bash", "sh", "ssh", "sshd", "systemd", "init", "cpulimit", NULL
 	};
 
-	// Static array to hold exclusion list (loaded from config or defaults)
-	static char *excluded_procs[256];
-	static int exclusion_list_loaded = 0;
-
 	// Load exclusion list from config file or use defaults
 	if (!exclusion_list_loaded) {
+		// Initialize hash table
+		memset(exclude_hash, 0, sizeof(exclude_hash));
+		
 		FILE *config_file = fopen("/etc/cpulimit/exclude.conf", "r");
 		
 		if (config_file) {
 			// Load from config file
 			char line[256];
-			int count = 0;
-			while (fgets(line, sizeof(line), config_file) && count < 255) {
+			while (fgets(line, sizeof(line), config_file)) {
 				// Remove newline and comments
 				char *comment = strchr(line, '#');
 				if (comment) *comment = '\0';
@@ -77,58 +174,39 @@ static int should_exclude_process(struct process *p, int exclude_interactive)
 				while (end > start && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end--;
 				*(end + 1) = '\0';
 				
-				// Skip empty lines
+				// Skip empty lines and add to hash table
 				if (*start) {
-					excluded_procs[count] = malloc(strlen(start) + 1);
-					strcpy(excluded_procs[count], start);
-					count++;
+					add_excluded_process(start);
 				}
 			}
-			excluded_procs[count] = NULL;
 			fclose(config_file);
 		} else {
 			// Use default list
-			int i;
-			for (i = 0; default_excluded_procs[i] != NULL; i++) {
-				excluded_procs[i] = malloc(strlen(default_excluded_procs[i]) + 1);
-				strcpy(excluded_procs[i], default_excluded_procs[i]);
+			for (int i = 0; default_excluded_procs[i] != NULL; i++) {
+				add_excluded_process(default_excluded_procs[i]);
 			}
-			excluded_procs[i] = NULL;
 		}
 		exclusion_list_loaded = 1;
 	}
 	
-	// Check if this process should be excluded
-	for (int i = 0; excluded_procs[i] != NULL; i++) {
-		size_t excluded_len = strlen(excluded_procs[i]);
-		size_t cmd_len = strlen(cmd_name);
-		
-		// Use safer comparison: check if cmd_name starts with excluded_proc name
-		// and is either exact match or followed by a space/null terminator
-		if (cmd_len >= excluded_len && 
-		    strncmp(cmd_name, excluded_procs[i], excluded_len) == 0 &&
-		    (cmd_name[excluded_len] == '\0' || cmd_name[excluded_len] == ' ')) {
-			return 1; // exclude this process
+	// Check if this process should be excluded using hash table lookup
+	if (is_process_excluded(cmd_name)) {
+		return 1; // exclude this process
+	}
+	
+	// Also check for login shells (commands starting with '-')
+	if (cmd_name[0] == '-' && strlen(cmd_name) > 1) {
+		char *login_shell = cmd_name + 1; // Skip the '-'
+		if (is_process_excluded(login_shell)) {
+			return 1; // exclude this login shell
 		}
-		
-		// Also check for login shells (commands starting with '-')
-		if (cmd_name[0] == '-' && cmd_len > 1) {
-			char *login_shell = cmd_name + 1; // Skip the '-'
-			size_t login_len = cmd_len - 1;
-			if (login_len >= excluded_len && 
-			    strncmp(login_shell, excluded_procs[i], excluded_len) == 0 &&
-			    (login_shell[excluded_len] == '\0' || login_shell[excluded_len] == ' ')) {
-				return 1; // exclude this login shell
-			}
-		}
-		
-		// Special handling for Python scripts - check full command line
-		if (strcmp(cmd_name, "python") == 0 || strcmp(cmd_name, "python3") == 0) {
-			// Check if this is a monitoring tool by looking at the full command
-			if (strstr(p->command, "nvitop") || strstr(p->command, "glances") ||
-			    strstr(p->command, "bpytop") || strstr(p->command, "py-spy")) {
-				return 1; // exclude Python monitoring tools
-			}
+	}
+	
+	// Special handling for Python scripts - extract actual program name
+	if (strcmp(cmd_name, "python") == 0 || strcmp(cmd_name, "python3") == 0) {
+		const char *python_program = extract_python_program_name(p->command);
+		if (python_program && is_process_excluded(python_program)) {
+			return 1; // exclude Python monitoring tools
 		}
 	}
 	
@@ -138,7 +216,7 @@ static int should_exclude_process(struct process *p, int exclude_interactive)
 static int get_boot_time()
 {
 	int uptime = 0;
-	FILE *fp = fopen ("/proc/uptime", "r");
+	FILE *fp = fopen("/proc/uptime", "r");
 	if (fp != NULL)
 	{
 		char buf[BUFSIZ];
@@ -149,7 +227,7 @@ static int get_boot_time()
 			double upsecs = strtod(buf, &end_ptr);
 			uptime = (int)upsecs;
 		}
-		fclose (fp);
+		fclose(fp);
 	}
 	time_t now = time(NULL);
 	return now - uptime;
@@ -341,5 +419,13 @@ int close_process_iterator(struct process_iterator *it) {
 		return 1;
 	}
 	it->dip = NULL;
+	
+	// Clean up exclusion list when process iterator is closed
+	static int cleanup_registered = 0;
+	if (!cleanup_registered) {
+		atexit(cleanup_exclusion_list);
+		cleanup_registered = 1;
+	}
+	
 	return 0;
 }
